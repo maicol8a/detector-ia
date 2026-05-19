@@ -804,9 +804,10 @@ async function analyzeDocx(arrayBuffer) {
     const docFile = zip.file('word/document.xml');
     if (docFile) {
       const docXml = await docFile.async('text');
-      const allRsids    = new Set(docXml.match(/w:rsid[A-Za-z]*="([0-9A-Fa-f]{8})"/g) || []);
-      const rsidDel     = (docXml.match(/w:rsidDel="[0-9A-Fa-f]{8}"/g) || []).length;
-      const rsidR       = new Set(docXml.match(/w:rsidR="([0-9A-Fa-f]{8})"/g) || []);
+      const allRsids = new Set(
+        [...docXml.matchAll(/w:rsid[A-Za-z]*="([0-9A-Fa-f]{8})"/g)].map(m => m[1])
+      );
+      const rsidDel = (docXml.match(/w:rsidDel="[0-9A-Fa-f]{8}"/g) || []).length;
       rawMeta['RSIDs únicos'] = allRsids.size;
       rawMeta['RSIDs de eliminación'] = rsidDel;
 
@@ -829,7 +830,9 @@ async function analyzeDocx(arrayBuffer) {
       }
 
       // Extraer texto para análisis lingüístico
-      const textContent = docXml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      // Bug fix: extraer texto real desde etiquetas <w:t> (contenido visible del doc)
+      const textContent = [...docXml.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)]
+        .map(m => m[1]).join(' ').replace(/\s+/g, ' ').trim();
       const lingSignals = analyzeLinguistics(textContent);
       signals.push(...lingSignals);
     }
