@@ -792,9 +792,14 @@ async function analyzeDocx(arrayBuffer) {
       }
 
       // Señal: nombre de herramienta IA
-      const aiTools = ['chatgpt','claude','gemini','copilot','grammarly','quillbot','jasper','gpt','openai','anthropic','perplexity','mistral','writesonic'];
+      const aiLLMsD = ['chatgpt','claude','gemini','copilot','grammarly','quillbot','jasper','gpt','openai','anthropic','perplexity','mistral','writesonic'];
+      const pyLibsD = ['python-docx','python_docx','reportlab','fpdf','weasyprint','pdfkit','pandoc'];
       const creatorLow = (creator + lastMod).toLowerCase();
-      const found = aiTools.find(t => creatorLow.includes(t));
+      const found   = aiLLMsD.find(t => creatorLow.includes(t));
+      const foundPy = pyLibsD.find(t => creatorLow.includes(t));
+      if (foundPy) {
+        signals.push({ category: 'metadata', name: '⚠️ Librería Python en metadatos de autor', value: creatorLow, score: 0.97, weight: 5.0, explain: `"${foundPy}" es una librería Python para generar documentos por código — el documento fue ensamblado automáticamente, no escrito manualmente.`, glossary: ['Metadatos', 'Pipeline Python'] });
+      }
       if (found) {
         signals.push({ category: 'metadata', name: '⚠️ Nombre de herramienta IA en metadatos', value: creatorLow, score: 0.99, weight: 5.0, explain: `Se detectó la palabra "${found}" en los campos de autoría del documento. Esto es una señal forense directa: el documento fue creado o modificado con una herramienta de IA que no limpió sus metadatos.`, glossary: ['Metadatos'] });
       }
@@ -879,11 +884,26 @@ async function analyzePdf(arrayBuffer) {
     rawMeta['Modificado']= info.ModDate  || '(no disponible)';
     rawMeta['Páginas']   = pdf.numPages;
 
-    const aiTools = ['chatgpt','claude','gpt','openai','anthropic','gemini','grammarly','quillbot','jasper','mistral'];
-    const combined = ((info.Creator || '') + (info.Producer || '') + (info.Author || '')).toLowerCase();
-    const found = aiTools.find(t => combined.includes(t));
-    if (found) {
-      signals.push({ category: 'metadata', name: '⚠️ Herramienta IA en metadatos PDF', value: combined.substring(0,80), score: 0.99, weight: 5.0, explain: `Se detectó "${found}" en los metadatos del PDF (campos Creator, Producer o Author). Señal forense directa de autoría artificial.`, glossary: ['Metadatos'] });
+    // Fix 1a: LLMs + librerías Python de generación documental
+    const aiLLMs     = ['chatgpt','claude','gpt','openai','anthropic','gemini','grammarly','quillbot','jasper','mistral','copilot','perplexity'];
+    const pyLibs     = ['python-docx','python_docx','reportlab','fpdf','weasyprint','pdfkit','xhtml2pdf','pandoc','docx2pdf','unoconv'];
+    const combined   = ((info.Creator || '') + (info.Producer || '') + (info.Author || '')).toLowerCase();
+    const foundLLM   = aiLLMs.find(t => combined.includes(t));
+    const foundPyLib = pyLibs.find(t => combined.includes(t));
+    if (foundLLM) {
+      signals.push({ category: 'metadata', name: '⚠️ Herramienta IA en metadatos PDF', value: `Creator="${info.Creator}" Producer="${info.Producer}"`, score: 0.99, weight: 5.0, explain: `Se detectó "${foundLLM}" en los metadatos del PDF. Señal forense directa.`, glossary: ['Metadatos'] });
+    }
+    if (foundPyLib) {
+      signals.push({ category: 'metadata', name: '⚠️ Librería Python de generación documental', value: `"${foundPyLib}" en metadatos`, score: 0.97, weight: 5.0, explain: `"${foundPyLib}" es una librería Python para crear documentos programáticamente. Su presencia en los metadatos indica que el documento fue ensamblado por código, no escrito manualmente en un procesador de texto.`, glossary: ['Metadatos', 'Pipeline Python'] });
+    }
+    // Fix 1b: pipeline de conversión DOCX→PDF (Creator≠Producer y alguno es Python/LibreOffice)
+    const creator  = (info.Creator  || '').toLowerCase();
+    const producer = (info.Producer || '').toLowerCase();
+    const conversionSigns = ['libreoffice','openoffice','python','ghostscript','cairo','unoconv'];
+    const hasConversionPipeline = creator && producer && creator !== producer
+      && conversionSigns.some(s => producer.includes(s) || creator.includes(s));
+    if (hasConversionPipeline) {
+      signals.push({ category: 'metadata', name: 'Pipeline de conversión documental detectado', value: `Creator="${info.Creator}" → Producer="${info.Producer}"`, score: 0.72, weight: 2.5, explain: `El PDF fue generado a través de un pipeline de conversión (distinto creador y productor, con herramientas de automatización). Patrón habitual en flujos de ensamblaje programático: generar en Word/DOCX con Python y exportar a PDF automáticamente.`, glossary: ['Metadatos', 'Pipeline Python'] });
     }
 
     // Timestamps
@@ -904,14 +924,35 @@ async function analyzePdf(arrayBuffer) {
       }
     }
 
-    // Texto
+    // Fix 2: todas las páginas (no solo 10)
     let fullText = '';
-    for (let i = 1; i <= Math.min(pdf.numPages, 10); i++) {
+    for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
       fullText += tc.items.map(it => it.str).join(' ') + '\n\n';
     }
+
+    // Fix 3: detectar declaración explícita de uso de IA en el texto
+    const textLow = fullText.toLowerCase();
+    const aiDeclarations = [
+      'ai was used', 'chatgpt was used', 'generated with ai', 'generated by ai',
+      'python support was used', 'ai-generated', 'generated using',
+      'openai was used', 'claude was used', 'gemini was used',
+      'language model was used', 'llm was used', 'gpt was used',
+      'report assembly', 'layout generation', 'automatically generated',
+      'ia fue utilizada', 'se usó ia', 'generado con ia', 'generado por ia',
+      'apoyo de python', 'ensamblaje automático',
+    ];
+    const foundDecl = aiDeclarations.find(d => textLow.includes(d));
+    if (foundDecl) {
+      const idx = textLow.indexOf(foundDecl);
+      const snippet = fullText.substring(Math.max(0, idx-20), idx+80).replace(/\s+/g,' ').trim();
+      signals.push({ category: 'linguistic', name: '⚠️ Declaración explícita de uso de IA en el texto', value: `"…${snippet}…"`, score: 0.97, weight: 5.0, explain: `El propio documento menciona el uso de IA o Python para su generación ("${foundDecl}"). Esta es la señal forense más directa posible: el documento se auto-documenta como AI-assisted.`, glossary: ['Declaración IA'] });
+    }
+
+    // Fix 4: análisis lingüístico con pesos x1.5 para PDF (sin RSIDs ni TotalTime)
     const lingSignals = analyzeLinguistics(fullText);
+    lingSignals.forEach(s => { s.weight = s.weight * 1.5; });
     signals.push(...lingSignals);
 
   } catch (e) {
@@ -1118,6 +1159,8 @@ const GLOSSARY = {
   'Coeficiente de variación (CV)': 'Medida estadística de dispersión relativa. CV bajo = valores muy similares entre sí (párrafos de longitud uniforme = sospechoso).',
   'PNG tEXt': 'Bloques de texto opcionales en archivos PNG que pueden contener metadatos arbitrarios, incluido el prompt de generación completo usado por herramientas de IA.',
   'Prompt IA': 'Instrucción textual enviada a un modelo de inteligencia artificial para generar una imagen o texto. Algunas herramientas lo embeben directamente en el archivo generado.',
+  'Pipeline Python': 'Flujo de trabajo automático en el que un script de Python genera, ensambla y exporta un documento sin intervención humana directa. Librerías como python-docx, reportlab o fpdf son herramientas habituales en este tipo de flujos.',
+  'Declaración IA': 'Mención explícita en el propio texto del documento al uso de IA, Python u otras herramientas de generación automática. Es la señal forense más directa posible: el documento se auto-documenta como AI-assisted.',
   'Software IA imagen': 'Herramienta de generación de imágenes por IA (Stable Diffusion, Midjourney, DALL-E, Firefly, etc.) que firma sus outputs en los metadatos.',
 };
 
