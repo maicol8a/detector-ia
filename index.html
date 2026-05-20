@@ -865,106 +865,238 @@ async function analyzeDocx(arrayBuffer) {
 }
 
 // ────────────────────────────────────────────────────────────────
-//  ANÁLISIS PDF
+//  ANÁLISIS PDF — arquitectura en 3 capas con debug visible
+//  Capa 1: PDF.js (metadatos + texto)
+//  Capa 2: Análisis semántico del texto extraído
+//  Capa 3: Señales de fallback + señal neutra si todo falla
 // ────────────────────────────────────────────────────────────────
+
 async function analyzePdf(arrayBuffer) {
-  const signals = [];
-  const rawMeta = {};
+  const signals  = [];
+  const rawMeta  = {};
+  const bytes    = new Uint8Array(arrayBuffer);
+
+  // ── CAPA 1: PDF.js ─────────────────────────────────────────────
+  let fullText   = '';
+  let textOk     = false;
+
+  rawMeta['_aviso_docx'] = 'Si tienes acceso al archivo .DOCX original, analízalo también: contiene más huellas forenses (RSIDs, TotalTime, revisiones) que el PDF exportado.';
 
   try {
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-    const meta = await pdf.getMetadata();
-    const info = meta.info || {};
+    if (!window.pdfjsLib) throw new Error('PDF.js no cargó desde CDN');
 
-    rawMeta['Título']    = info.Title    || '(vacío)';
-    rawMeta['Autor']     = info.Author   || '(vacío)';
-    rawMeta['Creator']   = info.Creator  || '(vacío)';
-    rawMeta['Producer']  = info.Producer || '(vacío)';
-    rawMeta['Creado']    = info.CreationDate || '(no disponible)';
-    rawMeta['Modificado']= info.ModDate  || '(no disponible)';
-    rawMeta['Páginas']   = pdf.numPages;
+    // getDocument acepta ArrayBuffer — ojo: puede haberse consumido, usar slice
+    const pdfDoc = await pdfjsLib.getDocument({
+      data: bytes.buffer,
+      disableFontFace: true,
+      verbosity: 0
+    }).promise;
 
-    // Fix 1a: LLMs + librerías Python de generación documental
-    const aiLLMs     = ['chatgpt','claude','gpt','openai','anthropic','gemini','grammarly','quillbot','jasper','mistral','copilot','perplexity'];
-    const pyLibs     = ['python-docx','python_docx','reportlab','fpdf','weasyprint','pdfkit','xhtml2pdf','pandoc','docx2pdf','unoconv'];
-    const combined   = ((info.Creator || '') + (info.Producer || '') + (info.Author || '')).toLowerCase();
-    const foundLLM   = aiLLMs.find(t => combined.includes(t));
-    const foundPyLib = pyLibs.find(t => combined.includes(t));
-    if (foundLLM) {
-      signals.push({ category: 'metadata', name: '⚠️ Herramienta IA en metadatos PDF', value: `Creator="${info.Creator}" Producer="${info.Producer}"`, score: 0.99, weight: 5.0, explain: `Se detectó "${foundLLM}" en los metadatos del PDF. Señal forense directa.`, glossary: ['Metadatos'] });
+    rawMeta['Páginas'] = pdfDoc.numPages;
+
+    // 1a. Metadatos vía PDF.js
+    const pjsMeta = await pdfDoc.getMetadata().catch(() => ({ info: {} }));
+    const info    = pjsMeta.info || {};
+
+    rawMeta['Creator']        = info.Creator     || '(vacío)';
+    rawMeta['Producer']       = info.Producer    || '(vacío)';
+    rawMeta['Author']         = info.Author      || '(vacío)';
+    rawMeta['Title']          = info.Title       || '(vacío)';
+    rawMeta['Fecha creación'] = info.CreationDate|| '(no disponible)';
+    rawMeta['Fecha modificación'] = info.ModDate || '(no disponible)';
+
+    // XMP (PDF.js expone meta.metadata como objeto con getAll())
+    if (pjsMeta.metadata) {
+      try {
+        const xmpAll = pjsMeta.metadata.getAll ? pjsMeta.metadata.getAll() : {};
+        for (const [k,v] of Object.entries(xmpAll)) {
+          if (typeof v === 'string' && v.trim())
+            rawMeta['XMP_' + k.split(':').pop()] = v.trim().substring(0,120);
+        }
+      } catch(_) {}
     }
-    if (foundPyLib) {
-      signals.push({ category: 'metadata', name: '⚠️ Librería Python de generación documental', value: `"${foundPyLib}" en metadatos`, score: 0.97, weight: 5.0, explain: `"${foundPyLib}" es una librería Python para crear documentos programáticamente. Su presencia en los metadatos indica que el documento fue ensamblado por código, no escrito manualmente en un procesador de texto.`, glossary: ['Metadatos', 'Pipeline Python'] });
-    }
-    // Fix 1b: pipeline de conversión DOCX→PDF (Creator≠Producer y alguno es Python/LibreOffice)
-    const creator  = (info.Creator  || '').toLowerCase();
-    const producer = (info.Producer || '').toLowerCase();
-    const conversionSigns = ['libreoffice','openoffice','python','ghostscript','cairo','unoconv'];
-    const hasConversionPipeline = creator && producer && creator !== producer
-      && conversionSigns.some(s => producer.includes(s) || creator.includes(s));
-    if (hasConversionPipeline) {
-      signals.push({ category: 'metadata', name: 'Pipeline de conversión documental detectado', value: `Creator="${info.Creator}" → Producer="${info.Producer}"`, score: 0.72, weight: 2.5, explain: `El PDF fue generado a través de un pipeline de conversión (distinto creador y productor, con herramientas de automatización). Patrón habitual en flujos de ensamblaje programático: generar en Word/DOCX con Python y exportar a PDF automáticamente.`, glossary: ['Metadatos', 'Pipeline Python'] });
-    }
+
+    // 1b. Señales de metadatos
+    const allMeta = Object.values(rawMeta).join(' ').toLowerCase();
+
+    const aiLLMs  = ['chatgpt','claude','gpt','openai','anthropic','gemini',
+                     'grammarly','quillbot','jasper','mistral','copilot','perplexity'];
+    const pyLibs  = ['python-docx','python_docx','reportlab','fpdf','weasyprint',
+                     'pdfkit','pandoc','docx2pdf','fpdf2','pdflatex','lualatex'];
+    const autoTools = ['python','libreoffice','openoffice','ghostscript','cairo',
+                       'unoconv','wkhtmltopdf'];
+
+    const foundLLM = aiLLMs.find(t => allMeta.includes(t));
+    const foundPy  = pyLibs.find(t => allMeta.includes(t));
+    const foundAuto= autoTools.find(t =>
+      (info.Producer||'').toLowerCase().includes(t) ||
+      (rawMeta['XMP_CreatorTool']||'').toLowerCase().includes(t)
+    );
+
+    if (foundLLM)
+      signals.push({ category:'metadata',
+        name:`⚠️ Herramienta IA en metadatos: "${foundLLM}"`,
+        value: `Creator="${info.Creator}" | Producer="${info.Producer}"`,
+        score:0.99, weight:5.0,
+        explain:`"${foundLLM}" detectado en los metadatos del PDF. Señal forense directa.`,
+        glossary:['Metadatos'] });
+
+    if (foundPy)
+      signals.push({ category:'metadata',
+        name:`⚠️ Librería de generación documental: "${foundPy}"`,
+        value: allMeta.substring(0,100),
+        score:0.97, weight:5.0,
+        explain:`"${foundPy}" es una librería que genera documentos por código Python. Su presencia confirma ensamblaje automático.`,
+        glossary:['Metadatos','Pipeline Python'] });
+
+    if (foundAuto && !foundPy && !foundLLM)
+      signals.push({ category:'metadata',
+        name:`Pipeline de automatización detectado: "${foundAuto}"`,
+        value:`Producer="${info.Producer}" | XMP_CreatorTool="${rawMeta['XMP_CreatorTool']||''}"`,
+        score:0.65, weight:2.0,
+        explain:`"${foundAuto}" aparece en los metadatos. Herramienta típica de conversión/ensamblaje automático de documentos.`,
+        glossary:['Metadatos','Pipeline Python'] });
+
+    // Pipeline DOCX→PDF: Creator ≠ Producer
+    const cr = (info.Creator ||'').toLowerCase();
+    const pr = (info.Producer||'').toLowerCase();
+    if (cr && pr && cr !== pr && cr.length > 3 && pr.length > 3)
+      signals.push({ category:'metadata',
+        name:'Creator y Producer distintos (pipeline de conversión)',
+        value:`"${info.Creator}" → "${info.Producer}"`,
+        score:0.60, weight:1.5,
+        explain:'El documento fue creado en una herramienta y convertido a PDF con otra. Patrón habitual en flujos automáticos: generar DOCX/HTML con Python y exportar a PDF con LibreOffice u otra utilidad.',
+        glossary:['Metadatos','Pipeline Python'] });
 
     // Timestamps
-    const parseDate = (s) => {
+    const parseDate = s => {
       if (!s) return null;
-      const m = s.match(/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+      const m = s.match(/(\d{4}).?(\d{2}).?(\d{2}).?(\d{2}).?(\d{2}).?(\d{2})/);
       return m ? new Date(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6]) : null;
     };
-    const dtC = parseDate(info.CreationDate);
-    const dtM = parseDate(info.ModDate);
+    const dtC = parseDate(info.CreationDate), dtM = parseDate(info.ModDate);
     if (dtC && dtM) {
-      const delta = Math.abs(dtM - dtC) / 1000;
+      const delta = Math.abs(dtM - dtC)/1000;
       rawMeta['Delta creación-modificación'] = `${Math.round(delta)} segundos`;
-      if (delta < 60) {
-        signals.push({ category: 'timestamp', name: 'Documento creado y exportado de inmediato', value: `${delta.toFixed(0)} segundos entre creación y guardado`, score: 0.82, weight: 2.5, explain: 'El PDF fue creado y modificado por última vez con menos de 1 minuto de diferencia. Esto sugiere que fue generado automáticamente y exportado de forma inmediata, sin proceso real de escritura o revisión humana.', glossary: ['Timestamps'] });
-      } else if (delta < 300) {
-        signals.push({ category: 'timestamp', name: 'Tiempo mínimo entre creación y exportación', value: `${(delta/60).toFixed(1)} minutos`, score: 0.55, weight: 2.0, explain: `Solo ${(delta/60).toFixed(1)} minutos entre la creación del archivo y su última modificación. Tiempo muy corto para un trabajo elaborado manualmente.`, glossary: ['Timestamps'] });
+      if (delta < 60)
+        signals.push({ category:'timestamp',
+          name:'Creado y cerrado en menos de 1 minuto',
+          value:`${delta.toFixed(0)}s`,
+          score:0.85, weight:2.5,
+          explain:'Tiempo entre creación y última modificación menor a 60 segundos: el PDF fue generado y exportado automáticamente, sin proceso de escritura.',
+          glossary:['Timestamps'] });
+      else if (delta < 300)
+        signals.push({ category:'timestamp',
+          name:'Tiempo de edición muy corto antes de exportar',
+          value:`${(delta/60).toFixed(1)} min`,
+          score:0.55, weight:1.8,
+          explain:`Solo ${(delta/60).toFixed(1)} minutos entre creación y exportación.`,
+          glossary:['Timestamps'] });
+    }
+
+    // 1c. Extracción de texto — todas las páginas
+    const textPages = [];
+    for (let i = 1; i <= pdfDoc.numPages; i++) {
+      const page = await pdfDoc.getPage(i);
+      const tc   = await page.getTextContent();
+      // Reconstruir con espacios correctos usando transform coords
+      let pageText = '';
+      let lastX = null, lastY = null;
+      for (const item of tc.items) {
+        if (!item.str) continue;
+        if (lastY !== null && Math.abs(item.transform[5] - lastY) > 5) {
+          pageText += '\n'; // salto de línea real
+        } else if (lastX !== null && item.transform[4] - lastX > 2) {
+          pageText += ' '; // espacio entre palabras
+        }
+        pageText += item.str;
+        lastX = item.transform[4] + (item.width || 0);
+        lastY = item.transform[5];
       }
+      textPages.push(pageText);
     }
+    fullText = textPages.join('\n\n');
+    textOk   = fullText.trim().length > 200;
 
-    // Fix 2: todas las páginas (no solo 10)
-    let fullText = '';
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const tc = await page.getTextContent();
-      fullText += tc.items.map(it => it.str).join(' ') + '\n\n';
-    }
+    rawMeta['_pdfjs_status']   = `✅ OK — ${pdfDoc.numPages} págs, ${fullText.length.toLocaleString()} chars`;
+    rawMeta['_texto_preview']  = fullText.replace(/\s+/g,' ').trim().substring(0,400);
 
-    // Fix 3: detectar declaración explícita de uso de IA en el texto
+  } catch(e) {
+    rawMeta['_pdfjs_status']  = '❌ ERROR: ' + e.message + ' — el análisis lingüístico no está disponible';
+    rawMeta['_texto_preview'] = '(no disponible)';
+  }
+
+  // ── CAPA 2: Análisis semántico del texto extraído ──────────────
+  if (textOk) {
     const textLow = fullText.toLowerCase();
+
+    // 2a. Declaraciones explícitas de uso de IA (peso máximo)
     const aiDeclarations = [
-      'ai was used', 'chatgpt was used', 'generated with ai', 'generated by ai',
-      'python support was used', 'ai-generated', 'generated using',
-      'openai was used', 'claude was used', 'gemini was used',
-      'language model was used', 'llm was used', 'gpt was used',
-      'report assembly', 'layout generation', 'automatically generated',
-      'ia fue utilizada', 'se usó ia', 'generado con ia', 'generado por ia',
-      'apoyo de python', 'ensamblaje automático',
+      { phrase:'ai was used',            label:'AI was used' },
+      { phrase:'ai use declaration',     label:'AI Use Declaration' },
+      { phrase:'chatgpt was used',       label:'ChatGPT was used' },
+      { phrase:'generated with ai',      label:'generated with AI' },
+      { phrase:'generated by ai',        label:'generated by AI' },
+      { phrase:'python support was used',label:'Python support was used' },
+      { phrase:'report assembly',        label:'report assembly' },
+      { phrase:'layout generation',      label:'layout generation' },
+      { phrase:'automatically generated',label:'automatically generated' },
+      { phrase:'openai was used',        label:'OpenAI was used' },
+      { phrase:'claude was used',        label:'Claude was used' },
+      { phrase:'gemini was used',        label:'Gemini was used' },
+      { phrase:'language model',         label:'language model' },
+      { phrase:'large language',         label:'large language model' },
+      { phrase:'ia fue utilizada',       label:'IA fue utilizada' },
+      { phrase:'se utilizó ia',          label:'se utilizó IA' },
+      { phrase:'generado con ia',        label:'generado con IA' },
+      { phrase:'uso de ia',              label:'uso de IA' },
+      { phrase:'apoyo de python',        label:'apoyo de Python' },
+      { phrase:'wording support',        label:'wording support (típico AI)' },
     ];
-    const foundDecl = aiDeclarations.find(d => textLow.includes(d));
-    if (foundDecl) {
-      const idx = textLow.indexOf(foundDecl);
-      const snippet = fullText.substring(Math.max(0, idx-20), idx+80).replace(/\s+/g,' ').trim();
-      signals.push({ category: 'linguistic', name: '⚠️ Declaración explícita de uso de IA en el texto', value: `"…${snippet}…"`, score: 0.97, weight: 5.0, explain: `El propio documento menciona el uso de IA o Python para su generación ("${foundDecl}"). Esta es la señal forense más directa posible: el documento se auto-documenta como AI-assisted.`, glossary: ['Declaración IA'] });
+
+    for (const { phrase, label } of aiDeclarations) {
+      const idx = textLow.indexOf(phrase);
+      if (idx === -1) continue;
+      const snippet = fullText.substring(Math.max(0,idx-20), idx+100)
+                              .replace(/\s+/g,' ').trim();
+      signals.push({ category:'linguistic',
+        name:`⚠️ Declaración de IA encontrada: "${label}"`,
+        value:`"…${snippet}…"`,
+        score:0.97, weight:6.0,
+        explain:`El texto contiene "${label}" — el documento declara explícitamente uso de IA o ensamblaje automático. Es la señal forense de mayor peso posible.`,
+        glossary:['Declaración IA'] });
+      break; // una sola señal de declaración (evitar duplicados)
     }
 
-    // Fix 4: análisis lingüístico con pesos x1.5 para PDF (sin RSIDs ni TotalTime)
+    // 2b. Análisis lingüístico (pesos x1.5 para PDF, sin RSIDs ni TotalTime)
     const lingSignals = analyzeLinguistics(fullText);
-    lingSignals.forEach(s => { s.weight = s.weight * 1.5; });
+    lingSignals.forEach(s => { s.weight *= 1.5; });
     signals.push(...lingSignals);
 
-  } catch (e) {
-    rawMeta['error'] = e.message;
+  } else if (rawMeta['_pdfjs_status'] && rawMeta['_pdfjs_status'].startsWith('❌')) {
+    // PDF.js falló: señal de indeterminación visible
+    signals.push({ category:'metadata',
+      name:'⚠️ Texto no extraíble — análisis incompleto',
+      value:'PDF.js no pudo leer el texto de este archivo',
+      score:0.50, weight:1.0,
+      explain:'El texto del PDF no pudo ser extraído. El resultado es INDETERMINADO, no una absolución. Intenta subir el archivo .DOCX original si lo tienes.',
+      glossary:[] });
+  }
+
+  // ── CAPA 3: Señal neutra si no hay ninguna señal ───────────────
+  if (signals.length === 0) {
+    signals.push({ category:'metadata',
+      name:'Sin señales forenses detectadas',
+      value:'Metadatos vacíos y texto no analizable',
+      score:0.50, weight:1.0,
+      explain:'No se pudo extraer ninguna señal del archivo. El resultado es INDETERMINADO. Sube el .DOCX original para un análisis forense completo.',
+      glossary:[] });
   }
 
   return { signals, rawMeta };
 }
 
-// ────────────────────────────────────────────────────────────────
-//  ANÁLISIS DE IMAGEN (JPEG/PNG)
-// ────────────────────────────────────────────────────────────────
+
 async function analyzeImage(arrayBuffer, ext) {
   const signals = [];
   const rawMeta = {};
@@ -1276,15 +1408,30 @@ function renderReport(file, fileType, signals, rawMeta, probability) {
     ${catSection('metadata')}
     ${catSection('linguistic')}
 
-    <!-- Raw metadata -->
-    ${metaRows ? `
-    <div class="section-card fade-up">
-      <div class="section-header">
-        <span class="section-icon">🗂️</span>
-        <span class="section-title">Metadatos en bruto extraídos</span>
+    <!-- Debug panel -->
+    <div class="section-card fade-up" id="debugPanel">
+      <div class="section-header" style="cursor:pointer" onclick="toggleDebug()">
+        <span class="section-icon">🛠️</span>
+        <span class="section-title">Panel de diagnóstico técnico</span>
+        <span class="section-count" id="debugToggleLabel">mostrar ▼</span>
       </div>
-      <div class="meta-grid">${metaRows}</div>
-    </div>` : ''}
+      <div id="debugContent" style="display:none">
+        ${rawMeta['_pdfjs_status'] ? `
+        <div style="margin-bottom:.8rem;padding:.6rem;border-radius:6px;background:${rawMeta['_pdfjs_status'].startsWith('OK') ? 'var(--green-light)' : 'var(--red-light)'}">
+          <strong>Estado PDF.js:</strong> <code style="font-size:.78rem">${escHtml(rawMeta['_pdfjs_status'] || '')}</code>
+        </div>` : ''}
+        ${rawMeta['_texto_preview'] ? `
+        <div style="margin-bottom:.8rem">
+          <strong style="font-size:.82rem;color:var(--gray-600)">Preview del texto extraído (primeros 400 chars):</strong>
+          <pre style="font-family:var(--font-mono);font-size:.72rem;background:var(--gray-50);border:1px solid var(--gray-200);border-radius:6px;padding:.6rem;white-space:pre-wrap;margin-top:.3rem;max-height:120px;overflow:auto">${escHtml(rawMeta['_texto_preview'] || '')}</pre>
+        </div>` : ''}
+        ${rawMeta['_aviso_docx'] ? `
+        <div style="padding:.8rem;background:var(--amber-light);border:1px solid var(--amber);border-radius:6px;font-size:.85rem;margin-bottom:.8rem">
+          💡 <strong>Recomendación:</strong> ${escHtml(rawMeta['_aviso_docx'])}
+        </div>` : ''}
+        ${metaRows ? `<div class="meta-grid">${metaRows}</div>` : '<p style="font-size:.82rem;color:var(--gray-400)">Sin metadatos extraídos.</p>'}
+      </div>
+    </div>
 
     <!-- Glossary -->
     ${glossEntries ? `
@@ -1304,6 +1451,13 @@ function renderReport(file, fileType, signals, rawMeta, probability) {
   reportEl.innerHTML = html;
   reportEl.style.display = 'block';
   reportEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function toggleDebug() {
+  const c = document.getElementById('debugContent');
+  const l = document.getElementById('debugToggleLabel');
+  if (c.style.display === 'none') { c.style.display='block'; l.textContent='ocultar ▲'; }
+  else { c.style.display='none'; l.textContent='mostrar ▼'; }
 }
 
 function resetApp() {
